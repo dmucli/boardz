@@ -1,24 +1,60 @@
-# Boardz
+<h1 align="center">Boardz</h1>
 
-Boardz is an iPhone app for LED climbing boards, made for training on your own. Pick your board, light a problem, log it, run a workout and see how you're getting on. It works with MoonBoard, Tension, Kilter, Decoy, Grasshopper, So iLL, Touchstone and Woods boards.
+<p align="center">
+  <strong>A simpler app for LED climbing boards, without the social network attached.</strong><br>
+  For iPhone. Works with MoonBoard, Tension, Kilter, Decoy, Grasshopper, So iLL, Touchstone and Woods boards.
+</p>
 
-Boardz is an independent fork of [Boardsesh](https://github.com/boardsesh/boardsesh). It builds on Boardsesh's open-source board catalogue, Bluetooth encoders and climb search, and it signs in to the Boardsesh service, so your logbook is the same in both apps. It isn't made or endorsed by Boardsesh, Aurora Climbing, Moon Climbing or any board maker.
+<p align="center">
+  <img alt="Platform: iPhone" src="https://img.shields.io/badge/platform-iPhone-151618">
+  <img alt="Licence: Apache 2.0" src="https://img.shields.io/badge/licence-Apache%202.0-1F5FFF">
+  <img alt="Built on Boardsesh" src="https://img.shields.io/badge/built%20on-Boardsesh-2A7347">
+</p>
 
-## Why a fork
+## The promise
 
-Boardsesh is built for climbing together: party sessions, a shared queue, a feed, comments. Boardz keeps what you use alone at your wall and leaves the rest out. It's about 13,000 lines of TypeScript, where Boardsesh's mobile app is about 235,000.
+Board apps keep adding social features: feeds, comments, followers, live group sessions, shared queues. None of that helps when you're standing under the wall between attempts.
 
-## What's in it
+Boardz is the other way round. It's a much simpler interface for climbing boards, with nothing that doesn't help you climb:
 
-There are five tabs.
+- It opens on your board. Set a grade range, tap a problem, and it's lit on the wall.
+- While you climb, the whole screen is the board. Nothing scrolls, nothing moves, and a swipe takes you to the next problem.
+- There are five tabs and no feed, comments, followers or party mode.
+- It's about 13,000 lines of code. Boardsesh's mobile app, which Boardz is forked from, is about 235,000.
 
-- **Home** shows your board and its Bluetooth connection, starts a session, and keeps your Favourites and Projects lists a tap away.
-- **Session** lists the board's climbs. Drag a grade range, keep to benchmarks, and search climb names and setters; the header counts what your filters leave.
-- **Workout** has nine plans. Warm-up, pyramid, ladder, volume and grade focus pick climbs by grade. On the minute, 4x4 and limit bouldering run on a timer. Free climbing is just a clock.
-- **Rankings** shows who has sent the most on a wall: yours, or public walls with the same setup.
-- **Profile** has your totals, top grades, grade pyramid, climbing calendar and full logbook.
+## Screens
 
-Open a climb and it fills the screen. The holds glow in your board's own LED colours, and nothing scrolls, so the wall stays put while you swipe left and right through the list. From the top bar you light the climb on your board, watch beta videos, save it to a list or log how it went.
+<table>
+  <tr>
+    <td align="center" width="33%"><img src="screenshots/home.png" alt="Home: the board, a live session and the Favourites and Projects lists"></td>
+    <td align="center" width="33%"><img src="screenshots/session.png" alt="Session: MoonBoard climbs between 6C and 7A, with grade tags"></td>
+    <td align="center" width="33%"><img src="screenshots/climb.png" alt="A MoonBoard problem filling the screen, its holds circled in LED colours"></td>
+  </tr>
+  <tr>
+    <td align="center"><b>Home</b><br>Your board, the session clock and your lists.</td>
+    <td align="center"><b>Session</b><br>Drag a grade range. The header counts what's left.</td>
+    <td align="center"><b>Climbing</b><br>The board fills the screen. Swipe for the next one.</td>
+  </tr>
+  <tr>
+    <td align="center"><img src="screenshots/beta.png" alt="Beta videos for a climb"></td>
+    <td align="center"><img src="screenshots/workout.png" alt="Workout plans"></td>
+    <td align="center"><img src="screenshots/climb-dark.png" alt="Climbing screen in dark mode"></td>
+  </tr>
+  <tr>
+    <td align="center"><b>Beta</b><br>Videos for the climb, your angle first.</td>
+    <td align="center"><b>Workouts</b><br>Nine plans, with climbs picked for you.</td>
+    <td align="center"><b>Dark mode</b><br>The board keeps its LED colours.</td>
+  </tr>
+</table>
+
+## What you can do
+
+- **Light and log.** Tap the bulb to light a problem on your board over Bluetooth, and the tick to log a flash, a send or your attempts. Your logbook is your Boardsesh logbook.
+- **Find problems.** Filter by grade range and benchmarks, and search climb names and setters. Grades are colour-coded, and benchmarks carry a BM tag.
+- **Train.** Warm-up, pyramid, ladder, volume and grade focus pick climbs by grade. On the minute, 4x4 and limit bouldering run on a timer. Boardz lights each climb in turn and counts down your rests.
+- **Keep lists.** The heart saves a problem to Favourites. Projects and your own lists sit one tap away, on Home.
+- **Watch beta.** Every climb's beta videos, with the ones filmed at your angle first.
+- **See how you're doing.** Rankings for your wall, and a profile with your totals, top grades, grade pyramid and climbing calendar.
 
 ## Status
 
@@ -37,13 +73,13 @@ vp run ios:boardz                     # builds and installs on your iPhone
 
 After that, `vp run dev:boardz` starts the dev server, and code changes load without a rebuild. `vp run typecheck:boardz` and `vp run test:boardz` check your work.
 
-## How this repository is laid out
+## Built on Boardsesh
 
-This is Boardsesh's monorepo with Boardz added. Boardz is entirely in `packages/boardz`. Everything else is Boardsesh as it is upstream, and Boardz doesn't change it apart from a few lint and formatting settings. That way Boardsesh's fixes to the shared packages arrive with a plain merge. The README at the repository root is Boardsesh's own.
+Boardz is an independent fork of [Boardsesh](https://github.com/boardsesh/boardsesh). It reuses Boardsesh's open-source board catalogue, Bluetooth encoders, climb search and workout generator, and it signs in to the Boardsesh service, so your logbook is the same in both apps. It isn't made or endorsed by Boardsesh, Aurora Climbing, Moon Climbing or any board maker.
 
-In this repository, GitHub Actions is switched off and Boardsesh's Dependabot config, sponsor link and code owners are removed, since they belong to Boardsesh's own project.
+This repository is Boardsesh's monorepo with Boardz added. Boardz is entirely in `packages/boardz`. Everything else is Boardsesh as it is upstream, apart from a few lint and formatting settings, so Boardsesh's fixes to the shared code arrive with a plain merge. The README at the repository root is Boardsesh's own. Here, GitHub Actions is switched off, and Boardsesh's Dependabot config, sponsor link and code owners are removed, since they belong to Boardsesh's project.
 
-## Keeping up with Boardsesh
+To pull in Boardsesh's latest changes:
 
 ```bash
 git remote add upstream https://github.com/boardsesh/boardsesh.git   # once
@@ -53,10 +89,8 @@ git merge upstream/main
 
 The usual conflict is `pnpm-lock.yaml`: take Boardsesh's copy with `git checkout --theirs pnpm-lock.yaml`, then run `vp install` to add Boardz back. If a merge brings back `.github/dependabot.yml`, `.github/FUNDING.yml` or `.github/CODEOWNERS`, delete them again. Finish with `vp run typecheck:boardz` and `vp run test:boardz`; between them they catch any shared code or backend query that changed.
 
-## Boardsesh's servers
-
 Boardz uses Boardsesh's hosted API at `ws.boardsesh.com` and signs in with Boardsesh accounts, email and password only. That service is run and paid for by the Boardsesh team. If Boardz is useful to you, you can [sponsor Boardsesh](https://github.com/sponsors/boardsesh).
 
 ## Licence
 
-Apache License 2.0, the same as Boardsesh: see [LICENSE](../LICENSE). Boardsesh's code belongs to its contributors, and every change made for Boardz is in this repository's history. MoonBoard, Kilter, Tension, Decoy, Grasshopper, So iLL, Touchstone and Woods are their owners' names, used here only to say which boards Boardz works with.
+Apache License 2.0, the same as Boardsesh: see [LICENSE](../LICENSE). Boardsesh's code belongs to its contributors, and every change made for Boardz is in this repository's history. MoonBoard, Kilter, Tension, Decoy, Grasshopper, So iLL, Touchstone and Woods are their owners' names, used here only to say which boards Boardz works with. The screenshots show public climbs from the Boardsesh catalogue.
