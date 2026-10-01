@@ -131,22 +131,36 @@ export const LED = {
   red: '#FF4A3D',
 } as const;
 
-export type BoardBackdrop = 'charcoal' | 'white' | 'yellow';
+/** The climber's pick in Settings: follow the theme, or MoonBoard yellow. */
+export type BoardBackdrop = 'auto' | 'yellow';
 
-/**
- * What a board is drawn on when its art is just the holds (MoonBoard, Woods).
- * The same in both themes, so the LEDs read true. Aurora boards show their
- * own photo over it.
- */
-export const BOARD_BACKDROPS: Record<BoardBackdrop, { panel: string; edge: string; hole: string }> = {
-  charcoal: { panel: '#24262A', edge: '#33363B', hole: '#3C3F45' },
-  white: { panel: '#F7F6F2', edge: '#DCDAD3', hole: '#CDCBC4' },
-  // MoonBoard's own yellow, a shade warmer so white holds keep their edges.
-  yellow: { panel: '#F2C734', edge: '#D6AC22', hole: '#D4AA27' },
+type Backdrop = {
+  panel: string;
+  edge: string;
+  hole: string;
+  /** Dark enough to want art made for dark backgrounds. */
+  dark: boolean;
 };
 
+const BOARD_BACKDROPS = {
+  white: { panel: '#FFFFFF', edge: '#DCDAD3', hole: '#D6D4CD', dark: false },
+  black: { panel: '#000000', edge: '#2A2C2F', hole: '#26282B', dark: true },
+  // MoonBoard's own yellow, a shade warmer so white holds keep their edges.
+  yellow: { panel: '#F2C734', edge: '#D6AC22', hole: '#D4AA27', dark: false },
+} satisfies Record<string, Backdrop>;
+
+/**
+ * What a board is drawn on when its art is just the holds (MoonBoard, Woods):
+ * white in light mode, black in dark mode, or yellow if the climber picked it.
+ * Aurora boards show their own photo over it.
+ */
+export function boardBackdrop(choice: BoardBackdrop, dark: boolean): Backdrop {
+  if (choice === 'yellow') return BOARD_BACKDROPS.yellow;
+  return dark ? BOARD_BACKDROPS.black : BOARD_BACKDROPS.white;
+}
+
 /** Dark frames for board-like tiles, such as beta video thumbnails. */
-export const BOARD_PANEL = BOARD_BACKDROPS.charcoal;
+export const BOARD_PANEL = BOARD_BACKDROPS.black;
 
 export type HoldRole = 'start' | 'hand' | 'foot' | 'finish';
 

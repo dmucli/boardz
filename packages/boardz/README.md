@@ -24,7 +24,7 @@ Boardz follows the Graphite design system in `designsystem/`: ink, paper and hai
 - Fonts are Geist and Geist Mono (`@expo-google-fonts`), loaded at launch. Icons are Lucide (`lucide-react-native`), imported one by one in `src/ui/icons.ts`.
 - `designsystem/` is the design hand-off, kept exactly as exported, so lint and format skip it.
 - Two departures from it: the main button on a screen is LED blue (`primary` in `theme.ts`) instead of ink, and grade tags are filled with their band colour instead of outlined.
-- MoonBoard and Woods holds are drawn on a charcoal, white or yellow backdrop, picked in Settings (`BOARD_BACKDROPS` in `theme.ts`).
+- MoonBoard and Woods holds are drawn on white in light mode and black in dark mode, or on MoonBoard yellow if you pick it in Settings (`boardBackdrop` in `theme.ts`).
 - Sheets use `src/ui/Sheet.tsx`. It works around react-native-screens resizing a sheet's scroll view on iOS 26, which drew the title over the first fields; its comment explains how.
 
 ### Limits
@@ -54,19 +54,28 @@ One-time setup:
 5. On the iPhone, turn on Settings → Privacy & Security → Developer Mode, then plug it into the Mac.
 6. Build and install. The first build takes 10–20 minutes:
    ```bash
-   vp run ios:boardz
+   vp run ios:boardz:release   # Boardz, for climbing
+   vp run ios:boardz           # Boardz Dev, for working on the code
    ```
-   If the device picker doesn't appear, run `vp exec expo run:ios --device` from `packages/boardz` instead.
+   If the device picker doesn't appear, run `vp exec expo run:ios --device` (add `--configuration Release` for Boardz) from `packages/boardz` instead.
 
-With a free Apple ID the app stops opening after 7 days. Run step 6 again to reinstall it. A paid developer account ($99/year) removes the limit and adds TestFlight.
+The two builds install as two apps, side by side:
 
-Day to day, start the dev server with `vp run dev:boardz` and open Boardz on your phone. Code changes load without a rebuild. You only rebuild when a native dependency changes.
+| App | Build | Code | Use it for |
+| --- | --- | --- | --- |
+| **Boardz** | `vp run ios:boardz:release` | Built into the app | Climbing. It works anywhere, with no Mac nearby, and runs faster. A code change needs a new build. |
+| **Boardz Dev** | `vp run ios:boardz` | Loaded from the dev server on your Mac | Working on the code. Start the server with `vp run dev:boardz`; changes appear on the phone as you save. Without the Mac on the same Wi-Fi it can't start. |
+
+Boardz Dev has its own bundle id (yours plus `.dev`, set up by `plugins/with-dev-app.js`), so it keeps its own sign-in, board and lists. In Xcode, the scheme's build configuration picks the app: Debug builds Boardz Dev, Release builds Boardz.
+
+With a free Apple ID both apps stop opening after 7 days. Build them again to reinstall. A paid developer account ($99/year) removes the limit and adds TestFlight.
 
 ### If the build fails
 
 - **"UIScene life cycle is required for apps built with this SDK"**: Xcode 27 won't launch an app that doesn't use scenes, and Expo 57's template doesn't yet. `plugins/with-scene-lifecycle.js` adds a scene delegate. If you see this error, the `ios/` folder predates the plugin. Regenerate it with `vp exec expo prebuild --platform ios` from `packages/boardz`.
 - **"plugin for module 'ExpoModulesMacros' not found"** after regenerating `ios/`: Xcode is building with stale settings. Run Product → Clean Build Folder (⇧⌘K) and build again.
 - **Sign-in doesn't survive a restart in the simulator**: a build with no signing team can't use the keychain. Pick your team under Signing & Capabilities once, and put it in `.env.local` so it survives a regenerated `ios/`.
+- **Changes to `app.config.ts` or `plugins/` don't show up**: they only reach the app when `ios/` is regenerated. Run `vp exec expo prebuild --platform ios` from `packages/boardz`. It rebuilds `ios/` from scratch, so anything set by hand in Xcode is lost; keep your team id in `.env.local`.
 
 ## Checks
 

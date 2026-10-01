@@ -32,11 +32,12 @@ describe('getBoardGeometry', () => {
     expect(a1.cy).toBeGreaterThan(k18.cy);
   });
 
-  it('draws a Woods board from its dark art, for both sizes', () => {
+  it('draws a Woods board from its art, with a dark cut, for both sizes', () => {
     const small = getBoardGeometry({ boardName: 'woods', layoutId: 1, sizeId: 1, setIds: [1] });
     const big = getBoardGeometry({ boardName: 'woods', layoutId: 1, sizeId: 2, setIds: [1] });
-    expect(small?.imagePaths).toEqual(['woods/woods-8x10-bg.dark.webp']);
-    expect(big?.imagePaths).toEqual(['woods/woods-12x12-bg.dark.webp']);
+    expect(small?.imagePaths).toEqual(['woods/woods-8x10-bg.webp']);
+    expect(small?.darkImagePaths).toEqual(['woods/woods-8x10-bg.dark.webp']);
+    expect(big?.imagePaths).toEqual(['woods/woods-12x12-bg.webp']);
     expect(small?.holds.size).toBeGreaterThan(0);
     expect((big?.holds.size ?? 0) > (small?.holds.size ?? 0)).toBe(true);
     expect(getBoardGeometry({ boardName: 'woods', layoutId: 1, sizeId: 9, setIds: [1] })).toBeNull();

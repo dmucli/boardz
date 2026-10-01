@@ -29,6 +29,8 @@ export type BoardGeometry = {
   height: number;
   /** Photo layers, bottom first, as paths under the website's /images/. */
   imagePaths: string[];
+  /** The same art cut for a dark background, where the board has one. */
+  darkImagePaths?: string[];
   holds: Map<number, HoldPosition>;
   /** Present for MoonBoards, which have lettered columns and numbered rows. */
   grid: BoardGrid | null;
@@ -85,9 +87,9 @@ function woodsGeometry({ sizeId }: GeometryBoard): BoardGeometry | null {
   return {
     width: details.boardWidth,
     height: details.boardHeight,
-    // The art is the holds cut out on transparency, and its dark cut is made for
-    // a dark background like the panel.
-    imagePaths: Object.keys(details.images_to_holds).map(
+    // The art is the holds cut out on transparency, in a light and a dark cut.
+    imagePaths: Object.keys(details.images_to_holds).map((filename) => `woods/${toWebp(filename)}`),
+    darkImagePaths: Object.keys(details.images_to_holds).map(
       (filename) => `woods/${filename.replace(/\.png$/, '.dark.webp')}`,
     ),
     holds: new Map(details.holdsData.map((hold) => [hold.id, { cx: hold.cx, cy: hold.cy, r: hold.r }])),

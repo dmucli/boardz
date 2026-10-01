@@ -9,16 +9,18 @@ export type Preferences = {
   gradeFormat: GradeDisplayFormat;
   /** The grade the last workout was set at (difficulty id), so the next one starts there. */
   workoutGrade: number | null;
-  /** What MoonBoard and Woods holds are drawn on. */
+  /** What MoonBoard and Woods holds are drawn on: the theme's white or black, or yellow. */
   boardBackdrop: BoardBackdrop;
 };
 
 // Font grades by default: MoonBoard problems are set and graded in Font.
-const DEFAULT_PREFERENCES: Preferences = { gradeFormat: 'font', workoutGrade: null, boardBackdrop: 'charcoal' };
+const DEFAULT_PREFERENCES: Preferences = { gradeFormat: 'font', workoutGrade: null, boardBackdrop: 'auto' };
 
 // Stored preferences are merged over the defaults, so a field added in a later
 // build doesn't throw away the ones already saved.
-function isStoredPreferences(value: unknown): value is Partial<Preferences> {
+type StoredPreferences = Partial<Omit<Preferences, 'boardBackdrop'>> & { boardBackdrop?: string };
+
+function isStoredPreferences(value: unknown): value is StoredPreferences {
   if (typeof value !== 'object' || value === null) return false;
   const candidate = value as Record<string, unknown>;
   return (
@@ -29,10 +31,7 @@ function isStoredPreferences(value: unknown): value is Partial<Preferences> {
     (candidate.workoutGrade === undefined ||
       candidate.workoutGrade === null ||
       typeof candidate.workoutGrade === 'number') &&
-    (candidate.boardBackdrop === undefined ||
-      candidate.boardBackdrop === 'charcoal' ||
-      candidate.boardBackdrop === 'white' ||
-      candidate.boardBackdrop === 'yellow')
+    (candidate.boardBackdrop === undefined || typeof candidate.boardBackdrop === 'string')
   );
 }
 
@@ -48,7 +47,14 @@ export function PreferencesProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     let cancelled = false;
     void readJson(STORAGE_KEY, isStoredPreferences).then((stored) => {
-      if (!cancelled && stored) setPreferences({ ...DEFAULT_PREFERENCES, ...stored });
+      if (!cancelled && stored) {
+        // Earlier builds stored 'charcoal' and 'white'; the theme now picks those.
+        setPreferences({
+          ...DEFAULT_PREFERENCES,
+          ...stored,
+          boardBackdrop: stored.boardBackdrop === 'yellow' ? 'yellow' : 'auto',
+        });
+      }
     });
     return () => {
       cancelled = true;

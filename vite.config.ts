@@ -1027,8 +1027,14 @@ export default defineConfig({
         command: 'pnpm --filter boardz run start',
         cache: false,
       },
+      // Debug: "Boardz Dev", which loads its code from the dev server on your Mac.
       'ios:boardz': {
         command: 'pnpm --filter boardz run ios',
+        cache: false,
+      },
+      // Release: "Boardz", with its code built in, so it works away from your Mac.
+      'ios:boardz:release': {
+        command: 'pnpm --filter boardz run ios:release',
         cache: false,
       },
       // Both backend projects: `backend-serial` holds the files that share

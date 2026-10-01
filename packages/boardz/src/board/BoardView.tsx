@@ -5,7 +5,7 @@ import type { BoardName } from '@boardsesh/shared-schema';
 import { WEB_BASE_URL } from '../api/env';
 import { Text } from '../ui/Text';
 import { usePreferences } from '../settings/preferences-provider';
-import { BOARD_BACKDROPS, holdLeds, useTheme } from '../ui/theme';
+import { boardBackdrop, holdLeds, useTheme } from '../ui/theme';
 import { GUTTER, spacing } from '../ui/tokens';
 import { getBoardGeometry, litHolds, type BoardGrid } from './board-geometry';
 
@@ -37,7 +37,7 @@ type BoardViewProps = {
 export function BoardView({ board, frames, maxHeight, horizontalInset = GUTTER * 2, lit = true }: BoardViewProps) {
   const theme = useTheme();
   const { width: windowWidth } = useWindowDimensions();
-  const backdrop = BOARD_BACKDROPS[usePreferences().boardBackdrop];
+  const backdrop = boardBackdrop(usePreferences().boardBackdrop, theme.dark);
   const geometry = getBoardGeometry(board);
 
   if (!geometry) {
@@ -51,6 +51,7 @@ export function BoardView({ board, frames, maxHeight, horizontalInset = GUTTER *
   }
 
   const { grid } = geometry;
+  const imagePaths = backdrop.dark && geometry.darkImagePaths ? geometry.darkImagePaths : geometry.imagePaths;
   // The part of the art the panel shows, in image pixels.
   const view = grid ? grid.crop : { x: 0, y: 0, width: geometry.width, height: geometry.height };
   const aspectRatio = view.width / view.height;
@@ -78,7 +79,7 @@ export function BoardView({ board, frames, maxHeight, horizontalInset = GUTTER *
         accessibilityLabel={`Board with ${holds.length} holds lit`}
       >
         {grid ? <HoleGrid grid={grid} viewBox={viewBox} color={backdrop.hole} /> : null}
-        {geometry.imagePaths.map((path) => (
+        {imagePaths.map((path) => (
           <Image
             key={path}
             source={{ uri: `${WEB_BASE_URL}/images/${path}` }}

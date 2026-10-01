@@ -14,14 +14,14 @@ import { ListRow } from '../../../src/ui/ListRow';
 import { SegmentedControl } from '../../../src/ui/SegmentedControl';
 import { Text } from '../../../src/ui/Text';
 import { TopBar } from '../../../src/ui/TopBar';
-import { BOARD_BACKDROPS, useTheme, type BoardBackdrop } from '../../../src/ui/theme';
+import { boardBackdrop, useTheme, type BoardBackdrop } from '../../../src/ui/theme';
 import { GUTTER, spacing } from '../../../src/ui/tokens';
 
 const BACKDROPS: { value: BoardBackdrop; label: string }[] = [
-  { value: 'charcoal', label: 'Charcoal' },
-  { value: 'white', label: 'White' },
+  { value: 'auto', label: 'Automatic' },
   { value: 'yellow', label: 'Yellow' },
 ];
+const boardBackdropColor = (choice: BoardBackdrop, dark: boolean) => boardBackdrop(choice, dark).panel;
 
 // The strip has room for short names; the full ones live in GRADE_FORMATS.
 const GRADE_FORMAT_LABELS = { font: 'Font', 'v-grade': 'V-scale', both: 'Both' } as const;
@@ -71,17 +71,24 @@ export default function SettingsScreen() {
               <View
                 key={backdrop.value}
                 style={[
-                  styles.swatch,
-                  {
-                    backgroundColor: BOARD_BACKDROPS[backdrop.value].panel,
-                    borderColor: boardBackdrop === backdrop.value ? theme.fg1 : BOARD_BACKDROPS[backdrop.value].edge,
-                  },
+                  styles.swatchFrame,
+                  { borderColor: boardBackdrop === backdrop.value ? theme.fg1 : theme.border2 },
                 ]}
-              />
+              >
+                {backdrop.value === 'auto' ? (
+                  <>
+                    <View style={[styles.swatch, { backgroundColor: boardBackdropColor('auto', false) }]} />
+                    <View style={[styles.swatch, { backgroundColor: boardBackdropColor('auto', true) }]} />
+                  </>
+                ) : (
+                  <View style={[styles.swatch, { backgroundColor: boardBackdropColor(backdrop.value, theme.dark) }]} />
+                )}
+              </View>
             ))}
           </View>
           <Text variant="small" tone="tertiary">
-            What MoonBoard and Woods holds are drawn on. Other boards show their own photo.
+            What MoonBoard and Woods holds are drawn on. Automatic is white in light mode and black in dark mode. Other
+            boards show their own photo.
           </Text>
         </Section>
 
@@ -143,5 +150,6 @@ const styles = StyleSheet.create({
   title: { paddingBottom: spacing.xs },
   flush: { marginHorizontal: -spacing.lg },
   swatches: { flexDirection: 'row', gap: spacing.sm },
-  swatch: { flex: 1, height: 28, borderRadius: 6, borderWidth: 1.5 },
+  swatchFrame: { flex: 1, height: 28, flexDirection: 'row', borderRadius: 6, borderWidth: 1.5, overflow: 'hidden' },
+  swatch: { flex: 1 },
 });

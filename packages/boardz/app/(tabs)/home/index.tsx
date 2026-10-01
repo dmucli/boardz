@@ -38,8 +38,8 @@ export default function HomeScreen() {
         <Section title="Board">
           <Text variant="title3">Set up your board</Text>
           <Text variant="small" tone="tertiary">
-            Tell Boardz which MoonBoard, Tension or Kilter you climb on, so it shows climbs that fit your wall and can
-            light them up.
+            Tell Boardz which board you climb on (MoonBoard, Tension, Kilter or another), so it shows climbs that fit
+            your wall and can light them up.
           </Text>
           <Button title="Set up board" size="lg" fullWidth onPress={() => router.push('/board-setup')} />
         </Section>

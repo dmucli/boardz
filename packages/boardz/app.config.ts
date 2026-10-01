@@ -37,6 +37,8 @@ export default ({ config }: ConfigContext): ExpoConfig => ({
     'react-native-ble-plx',
     // The iOS 27 SDK won't launch an app without a UIScene life cycle.
     './plugins/with-scene-lifecycle',
+    // Debug builds install as "Boardz Dev" (bundle id + ".dev"), next to the release build.
+    './plugins/with-dev-app',
     // Boardz only plays its workout beeps, but expo-audio links iOS recording
     // APIs, and App Store Connect rejects a build that links them without a
     // microphone purpose string. Boardz never asks for the microphone. The

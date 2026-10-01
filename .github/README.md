@@ -68,10 +68,10 @@ The app lives in [`packages/boardz`](../packages/boardz). Its [README](../packag
 curl -fsSL https://vite.plus | bash   # the vp toolchain Boardsesh uses
 vp install
 echo "BOARDZ_IOS_BUNDLE_ID=com.yourname.boardz" > packages/boardz/.env.local
-vp run ios:boardz                     # builds and installs on your iPhone
+vp run ios:boardz:release             # builds and installs Boardz on your iPhone
 ```
 
-After that, `vp run dev:boardz` starts the dev server, and code changes load without a rebuild. `vp run typecheck:boardz` and `vp run test:boardz` check your work.
+To work on the code, `vp run ios:boardz` installs a second app, Boardz Dev, which loads its code from the dev server (`vp run dev:boardz`), so changes appear on the phone as you save. `vp run typecheck:boardz` and `vp run test:boardz` check your work.
 
 ## Built on Boardsesh
 
