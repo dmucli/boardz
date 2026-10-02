@@ -25,6 +25,7 @@ Boardz follows the Graphite design system in `designsystem/`: ink, paper and hai
 - `designsystem/` is the design hand-off, kept exactly as exported, so lint and format skip it.
 - Two departures from it: the main button on a screen is LED blue (`primary` in `theme.ts`) instead of ink, and grade tags are filled with their band colour instead of outlined.
 - MoonBoard and Woods holds are drawn on white in light mode and black in dark mode, or on MoonBoard yellow if you pick it in Settings (`boardBackdrop` in `theme.ts`).
+- The app icon is a problem on the board: start, hand and finish holds lit in green, blue and red. It's an Icon Composer document, `assets/AppIcon.icon`, so iOS 26 draws the holds in Liquid Glass and makes the dark, tinted and clear versions. Edit it with Icon Composer, which comes with Xcode (Xcode → Open Developer Tool).
 - Sheets use `src/ui/Sheet.tsx`. It works around react-native-screens resizing a sheet's scroll view on iOS 26, which drew the title over the first fields; its comment explains how.
 
 ### Limits

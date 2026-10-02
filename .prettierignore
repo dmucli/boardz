@@ -64,3 +64,5 @@ packages/shared/hold-detection/src/__tests__/fixtures/*.json
 
 # Boardz's design system hand-off: kept exactly as exported.
 packages/boardz/designsystem/
+# Icon Composer rewrites icon.json in its own style on every save.
+packages/boardz/assets/*.icon/

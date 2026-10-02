@@ -25,6 +25,9 @@ export default ({ config }: ConfigContext): ExpoConfig => ({
     bundleIdentifier,
     ...(appleTeamId ? { appleTeamId } : {}),
     supportsTablet: false,
+    // An Icon Composer document: iOS 26 draws the holds in Liquid Glass and
+    // makes the dark, tinted and clear versions; Xcode makes flat ones for older iOS.
+    icon: './assets/AppIcon.icon',
     infoPlist: {
       ITSAppUsesNonExemptEncryption: false,
       NSBluetoothAlwaysUsageDescription:

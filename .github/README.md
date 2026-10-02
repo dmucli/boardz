@@ -1,3 +1,10 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="icon-dark.png">
+    <img src="icon.png" width="128" height="128" alt="The Boardz icon: a problem's start, hand and finish holds lit in green, blue and red">
+  </picture>
+</p>
+
 <h1 align="center">Boardz</h1>
 
 <p align="center">

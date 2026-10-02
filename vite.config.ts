@@ -46,6 +46,8 @@ export default defineConfig({
       'design/**',
       // Boardz's design system hand-off: kept exactly as exported.
       'packages/boardz/designsystem/**',
+      // Icon Composer rewrites icon.json in its own style on every save.
+      'packages/boardz/assets/*.icon/**',
       '**/generated/**',
       '**/board-controller/**',
       'CHANGELOG.md',

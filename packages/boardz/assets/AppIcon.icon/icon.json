@@ -1,0 +1,179 @@
+{
+  "fill": {
+    "linear-gradient": [
+      "extended-srgb:1.00000,1.00000,1.00000,1.00000",
+      "extended-srgb:0.90196,0.89020,0.86275,1.00000"
+    ]
+  },
+  "fill-specializations": [
+    {
+      "value": {
+        "linear-gradient": [
+          "extended-srgb:1.00000,1.00000,1.00000,1.00000",
+          "extended-srgb:0.90196,0.89020,0.86275,1.00000"
+        ]
+      }
+    },
+    {
+      "appearance": "dark",
+      "value": {
+        "linear-gradient": [
+          "extended-srgb:0.14510,0.15294,0.17255,1.00000",
+          "extended-srgb:0.04314,0.04706,0.05098,1.00000"
+        ]
+      }
+    }
+  ],
+  "groups": [
+    {
+      "name": "Holds",
+      "layers": [
+        {
+          "fill-specializations": [
+            {
+              "value": {
+                "solid": "extended-srgb:0.90980,0.22353,0.16863,1.00000"
+              }
+            },
+            {
+              "appearance": "dark",
+              "value": {
+                "solid": "extended-srgb:1.00000,0.29020,0.23922,1.00000"
+              }
+            },
+            {
+              "appearance": "tinted",
+              "value": {
+                "solid": "extended-srgb:1.00000,1.00000,1.00000,1.00000"
+              }
+            }
+          ],
+          "glass": true,
+          "image-name": "finish.svg",
+          "name": "finish"
+        },
+        {
+          "fill-specializations": [
+            {
+              "value": {
+                "solid": "extended-srgb:0.12157,0.37255,1.00000,1.00000"
+              }
+            },
+            {
+              "appearance": "dark",
+              "value": {
+                "solid": "extended-srgb:0.23922,0.52549,1.00000,1.00000"
+              }
+            },
+            {
+              "appearance": "tinted",
+              "value": {
+                "solid": "extended-srgb:1.00000,1.00000,1.00000,1.00000"
+              }
+            }
+          ],
+          "glass": true,
+          "image-name": "hand.svg",
+          "name": "hand"
+        },
+        {
+          "fill-specializations": [
+            {
+              "value": {
+                "solid": "extended-srgb:0.12157,0.68627,0.34118,1.00000"
+              }
+            },
+            {
+              "appearance": "dark",
+              "value": {
+                "solid": "extended-srgb:0.16863,0.83922,0.41961,1.00000"
+              }
+            },
+            {
+              "appearance": "tinted",
+              "value": {
+                "solid": "extended-srgb:1.00000,1.00000,1.00000,1.00000"
+              }
+            }
+          ],
+          "glass": true,
+          "image-name": "start.svg",
+          "name": "start"
+        }
+      ],
+      "shadow": {
+        "kind": "layer-color",
+        "opacity": 0.5
+      },
+      "translucency": {
+        "enabled": false,
+        "value": 0.5
+      },
+      "specular": true,
+      "lighting": "individual"
+    },
+    {
+      "name": "Board",
+      "layers": [
+        {
+          "image-name-specializations": [
+            {
+              "value": "glow-light.png"
+            },
+            {
+              "appearance": "dark",
+              "value": "glow-dark.png"
+            }
+          ],
+          "name": "glow",
+          "glass": false,
+          "position": {
+            "scale": 2,
+            "translation-in-points": [
+              0,
+              0
+            ]
+          }
+        },
+        {
+          "fill-specializations": [
+            {
+              "value": {
+                "solid": "extended-srgb:0.81176,0.79608,0.76078,1.00000"
+              }
+            },
+            {
+              "appearance": "dark",
+              "value": {
+                "solid": "extended-srgb:0.22745,0.23922,0.26667,1.00000"
+              }
+            },
+            {
+              "appearance": "tinted",
+              "value": {
+                "solid": "extended-srgb:1.00000,1.00000,1.00000,0.28000"
+              }
+            }
+          ],
+          "image-name": "holes.svg",
+          "name": "holes",
+          "glass": false
+        }
+      ],
+      "shadow": {
+        "kind": "none",
+        "opacity": 0.5
+      },
+      "translucency": {
+        "enabled": false,
+        "value": 0.5
+      },
+      "specular": false
+    }
+  ],
+  "supported-platforms": {
+    "squares": [
+      "iOS"
+    ]
+  }
+}
