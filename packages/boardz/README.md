@@ -10,7 +10,7 @@ Boardz never edits `packages/mobile` or `packages/shared/*`. That keeps merges f
 - **Session**: drag the two thumbs on the grade scale to pick a range (a thumb at either end leaves that end open), toggle benchmarks, and tap the magnifying glass to search climb names and setters. The list header counts the climbs your filters leave. Easiest and Hardest first only list climbs someone has repeated, since the rest are mostly ungraded.
 - **Climbing**: a climb fills the screen and nothing on it scrolls, so the board stays put while you swipe left or right through the list. The top bar holds the board light (tap to light the climb or switch it off), beta videos, lists, the favourite heart and Log.
 - **Lists**: the heart on a climb adds it to Favourites; the list button saves it to Projects or a list of your own. Lists are kept on the phone and don't sync with boardsesh.com.
-- **Workout**: nine plans. Warm-up, pyramid, ladder, volume and grade focus pick climbs by grade. On the minute, 4x4 and limit bouldering run on a timer. Free climbing is just a clock. Boardz picks the climbs, lets you swap any of them, lights each one in turn, counts down rests with beeps and logs what you do.
+- **Workout**: nine plans. Warm-up, pyramid, ladder, volume and grade focus pick climbs by grade. On the minute, 4x4 and limit bouldering run on a timer. Free climbing is just a clock. Boardz picks the climbs, lets you swap any of them, lights each one in turn, counts down rests with beeps and logs what you do. It only picks climbs with more than 50 ascents at your angle and a rating above 3.5 stars. Every workout can also stick to benchmarks or skip what you've sent.
 - **Rankings**: who has sent the most on a wall, this week, month, year or all time. Boardsesh ranks sends per wall, so the chips at the top offer your walls first, then public walls (gyms' and climbers' shared ones) with the same setup. Most walls have only a few sends logged.
 - **Profile**: one page with your totals and where you rank among Boardsesh climbers, hardest send and flash, the past month compared with the month before, an activity calendar, a grade chart and your recent climbing days. Your full logbook and settings are one tap away.
 
@@ -70,6 +70,17 @@ The two builds install as two apps, side by side:
 Boardz Dev has its own bundle id (yours plus `.dev`, set up by `plugins/with-dev-app.js`), so it keeps its own sign-in, board and lists. In Xcode, the scheme's build configuration picks the app: Debug builds Boardz Dev, Release builds Boardz.
 
 With a free Apple ID both apps stop opening after 7 days. Build them again to reinstall. A paid developer account ($99/year) removes the limit and adds TestFlight.
+
+### TestFlight and the App Store
+
+With a paid account, `vp run ios:boardz:testflight` builds Boardz for the App Store and uploads it (`scripts/testflight.sh`). The same upload serves TestFlight and an App Store release. It needs:
+
+- an app in App Store Connect with your bundle id (Apps → + → New App)
+- Xcode signed in to that account under Settings → Accounts
+
+Xcode creates the distribution certificate the first time, and picks the next free build number on each upload. The build shows in App Store Connect → TestFlight once Apple has processed it, usually within 30 minutes. To make the App Store build without uploading it, run `sh scripts/testflight.sh --no-upload` from `packages/boardz`.
+
+`store/listing.md` has the App Store listing text, privacy answers and review notes. `store/screenshots/` has the 6.9" iPhone screenshots, in upload order. `PRIVACY.md` is the privacy policy the listing links to.
 
 ### If the build fails
 

@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import { ActivityIndicator, Alert, Pressable, ScrollView, StyleSheet, View } from 'react-native';
 import { router, useLocalSearchParams } from 'expo-router';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import type { Climb } from '@boardsesh/shared-schema';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { getGradesForBoard } from '@boardsesh/board-config';
 import { describeRequestError } from '../../../src/api/graphql-client';
 import { useAuth } from '../../../src/auth/auth-provider';
@@ -14,7 +14,7 @@ import { gradeBand, gradeLabel, gradeOptions, type GradeOption } from '../../../
 import { useSession } from '../../../src/session/session-provider';
 import { usePreferences } from '../../../src/settings/preferences-provider';
 import { WORKOUTS, type WorkoutKind } from '../../../src/workout/catalog';
-import { fetchGradePools } from '../../../src/workout/fetch-pools';
+import { fetchGradePool, fetchGradeRange, type GradePool } from '../../../src/workout/fetch-pools';
 import { formatSeconds, formatSecondsShort } from '../../../src/workout/format';
 import { pickClimbs, swapClimb, type PlannedClimb } from '../../../src/workout/pick-climbs';
 import {
@@ -126,7 +126,20 @@ function initialGrade(grades: GradeOption[], remembered: number | null): number 
   return grades[Math.floor(grades.length / 2)]?.difficultyId ?? FALLBACK_GRADE;
 }
 
-type Preview = { planned: PlannedClimb[]; missing: number; pools: Map<number, Climb[]> };
+type Preview = { planned: PlannedClimb[]; missing: number; pools: Map<number, GradePool> };
+
+// Settings changes rebuild the plan after this pause, so stepping through
+// values doesn't search for each one.
+const BUILD_DELAY_MS = 250;
+
+/** The usable grade closest to `grade`, so a remembered grade the board lacks still works. */
+function nearestGrade(grade: number, usable: readonly GradeOption[]): number {
+  let best = usable[0]?.difficultyId ?? grade;
+  for (const option of usable) {
+    if (Math.abs(option.difficultyId - grade) < Math.abs(best - grade)) best = option.difficultyId;
+  }
+  return best;
+}
 
 export default function WorkoutSetupScreen() {
   const theme = useTheme();
@@ -134,34 +147,87 @@ export default function WorkoutSetupScreen() {
   const params = useLocalSearchParams<{ kind: string }>();
   const definition = WORKOUTS.find((workout) => workout.kind === params.kind);
   const { board } = useBoard();
-  const { status } = useAuth();
+  const { status, profile } = useAuth();
+  const queryClient = useQueryClient();
   const { gradeFormat, workoutGrade, update } = usePreferences();
   const workoutContext = useWorkout();
   const session = useSession();
   const { setClimbs } = useClimbSequence();
-  const grades = board ? gradeOptions(board.boardName, gradeFormat) : [];
+  const boardGrades = board ? gradeOptions(board.boardName, gradeFormat) : [];
 
   const [config, setConfig] = useState<WorkoutConfig | null>(() =>
-    definition ? defaultConfig(definition.kind, initialGrade(grades, workoutGrade)) : null,
+    definition ? defaultConfig(definition.kind, initialGrade(boardGrades, workoutGrade)) : null,
   );
   const [preview, setPreview] = useState<Preview | null>(null);
   const [building, setBuilding] = useState(false);
   const [buildError, setBuildError] = useState<string | null>(null);
   const [shuffleCount, setShuffleCount] = useState(0);
 
-  // Rebuild the preview whenever a setting changes, after a short pause so
-  // stepping through values doesn't fire a search for each one.
-  const buildKey = JSON.stringify([config, board ? toSearchConfig(board) : null, status, shuffleCount]);
+  const isFree = config?.kind === 'freeClimbing';
+  const signedIn = status === 'signedIn';
+  const searchConfig = board ? toSearchConfig(board) : null;
+  const filters = {
+    benchmarksOnly: config?.benchmarksOnly ?? false,
+    unsentFirst: (config?.freshClimbsOnly ?? false) && signedIn,
+  };
+
+  // Only grades with workout climbs on this board can be picked or planned.
+  const range = useQuery({
+    queryKey: ['workoutGradeRange', searchConfig, filters.benchmarksOnly],
+    queryFn: () => (board ? fetchGradeRange(board, filters) : null),
+    enabled: board !== null && config !== null && !isFree,
+    staleTime: 30 * 60_000,
+  });
+  const gradeRange = range.data ?? null;
+  const usableGrades = gradeRange
+    ? boardGrades.filter((grade) => grade.difficultyId >= gradeRange.lowest && grade.difficultyId <= gradeRange.highest)
+    : boardGrades;
+  const targetGrade = config ? nearestGrade(config.targetGrade, usableGrades) : null;
+
+  // Rebuild the plan when something that picks climbs changes. Rest and timer
+  // settings don't, and each grade's climbs are cached, so a shuffle, or a
+  // grade the plan already had, needs no search.
+  const planKey = JSON.stringify([
+    config && {
+      ...config,
+      restSeconds: 0,
+      intervalSeconds: 0,
+      restBetweenClimbsSeconds: 0,
+      restBetweenRoundsSeconds: 0,
+      goalMinutes: 0,
+      rounds: 0,
+    },
+    targetGrade,
+    searchConfig,
+    filters,
+    profile?.id ?? null,
+    gradeRange,
+    shuffleCount,
+  ]);
   useEffect(() => {
-    if (!board || !config || config.kind === 'freeClimbing') return;
+    if (!board || !config || isFree || !gradeRange || targetGrade === null) return;
     let cancelled = false;
     setBuilding(true);
     setBuildError(null);
+    const scale = getGradesForBoard(board.boardName).filter(
+      (grade) => grade.difficulty_id >= gradeRange.lowest && grade.difficulty_id <= gradeRange.highest,
+    );
     const timer = setTimeout(() => {
-      const planned = plannedGrades(config, getGradesForBoard(board.boardName));
-      fetchGradePools(board, planned, { unsentOnly: config.freshClimbsOnly && status === 'signedIn' })
-        .then((pools) => {
-          if (!cancelled) setPreview({ ...pickClimbs(planned, pools), pools });
+      const planned = plannedGrades({ ...config, targetGrade }, scale);
+      Promise.all(
+        [...new Set(planned)].map(async (grade) => {
+          const pool = await queryClient.fetchQuery({
+            queryKey: ['workoutPool', searchConfig, grade, filters, profile?.id ?? null],
+            queryFn: () => fetchGradePool(board, grade, filters),
+            staleTime: 10 * 60_000,
+          });
+          return [grade, pool] as const;
+        }),
+      )
+        .then((entries) => {
+          if (cancelled) return;
+          const pools = new Map(entries);
+          setPreview({ ...pickClimbs(planned, pools), pools });
         })
         .catch((error: unknown) => {
           if (!cancelled) setBuildError(describeRequestError(error));
@@ -169,12 +235,12 @@ export default function WorkoutSetupScreen() {
         .finally(() => {
           if (!cancelled) setBuilding(false);
         });
-    }, 400);
+    }, BUILD_DELAY_MS);
     return () => {
       cancelled = true;
       clearTimeout(timer);
     };
-  }, [buildKey]);
+  }, [planKey]);
 
   if (!definition || !config) {
     return (
@@ -190,12 +256,15 @@ export default function WorkoutSetupScreen() {
   const change = (changes: Partial<WorkoutConfig>) => setConfig({ ...config, ...changes });
   const gradeIndex = Math.max(
     0,
-    grades.findIndex((grade) => grade.difficultyId === config.targetGrade),
+    usableGrades.findIndex((grade) => grade.difficultyId === targetGrade),
   );
-  const targetLabel = grades[gradeIndex]?.label ?? '';
-  const isFree = config.kind === 'freeClimbing';
+  const targetLabel = usableGrades[gradeIndex]?.label ?? '';
   const planned = preview?.planned ?? [];
-  const canStart = board !== null && (isFree || (planned.length > 0 && !building));
+  const loading = building || range.isFetching;
+  const noClimbs = range.isSuccess && range.data === null;
+  // A failed or empty grade lookup leaves the last plan on screen; it mustn't start.
+  const canStart = board !== null && (isFree || (planned.length > 0 && !loading && !noClimbs && !range.isError));
+  const startLabel = definition.name === '4x4' ? 'Start 4x4' : `Start ${definition.name.toLowerCase()}`;
 
   const start = () => {
     const begin = () => {
@@ -207,7 +276,7 @@ export default function WorkoutSetupScreen() {
         goalMinutes: isFree ? config.goalMinutes : null,
       });
       session.start();
-      if (!isFree) update({ workoutGrade: config.targetGrade });
+      if (!isFree && targetGrade !== null) update({ workoutGrade: targetGrade });
       router.push('/workout-run');
     };
     if (workoutContext.workout) {
@@ -230,18 +299,20 @@ export default function WorkoutSetupScreen() {
     config.kind === 'fourByFour'
       ? `${planned.length} climbs × ${config.rounds} rounds`
       : `${planned.length} ${planned.length === 1 ? 'climb' : 'climbs'}`;
-  const summary = preview ? `${climbCount} · about ${estimateMinutes(config, planned.length)} min` : null;
+  const summary = preview && !noClimbs ? `${climbCount} · about ${estimateMinutes(config, planned.length)} min` : '';
+  const error = buildError ?? (range.error ? describeRequestError(range.error) : null);
+  const retry = () => {
+    if (range.isError) void range.refetch();
+    else setShuffleCount(shuffleCount + 1);
+  };
 
   return (
     <View style={[styles.flex, { backgroundColor: theme.bgApp }]}>
       <TopBar label={`Workout · ${definition.name}`} />
       <ScrollView contentContainerStyle={styles.content} keyboardShouldPersistTaps="handled">
-        <View style={styles.titleBlock}>
-          <Text variant="title1">{definition.name}</Text>
-          <Text variant="small" tone="tertiary">
-            {definition.summary}
-          </Text>
-        </View>
+        <Text variant="title1" style={styles.title}>
+          {definition.name}
+        </Text>
 
         {!board ? (
           <Section>
@@ -250,16 +321,16 @@ export default function WorkoutSetupScreen() {
           </Section>
         ) : (
           <>
-            <Section title="Settings">
+            <Section>
               {!isFree ? (
                 <Stepper
                   label={gradeFieldLabel(config.kind)}
                   showLabel
                   value={gradeIndex}
                   min={0}
-                  max={Math.max(0, grades.length - 1)}
-                  format={(index) => grades[index]?.label ?? ''}
-                  onChange={(index) => change({ targetGrade: grades[index].difficultyId })}
+                  max={Math.max(0, usableGrades.length - 1)}
+                  format={(index) => usableGrades[index]?.label ?? ''}
+                  onChange={(index) => change({ targetGrade: usableGrades[index].difficultyId })}
                 />
               ) : null}
               {numericFields.map((field) => {
@@ -307,63 +378,55 @@ export default function WorkoutSetupScreen() {
                 />
               ) : null}
               {usesField(config.kind, 'warmUp') ? (
+                <Switch label="Warm up first" value={config.warmUp} onValueChange={(warmUp) => change({ warmUp })} />
+              ) : null}
+              {usesField(config.kind, 'benchmarksOnly') ? (
                 <Switch
-                  label="Warm up first"
-                  description="Four easier climbs before the main set"
-                  value={config.warmUp}
-                  onValueChange={(warmUp) => change({ warmUp })}
+                  label="Benchmarks only"
+                  value={config.benchmarksOnly}
+                  onValueChange={(benchmarksOnly) => change({ benchmarksOnly })}
                 />
               ) : null}
               {usesField(config.kind, 'freshClimbsOnly') ? (
                 <Switch
-                  label="Climbs I haven't sent"
-                  description={
-                    status === 'signedIn' ? 'Tops up with sent ones if a grade runs short' : 'Sign in to use this'
-                  }
-                  value={config.freshClimbsOnly && status === 'signedIn'}
-                  disabled={status !== 'signedIn'}
+                  label="Hide what I've sent"
+                  description={signedIn ? undefined : 'Sign in to use this'}
+                  value={config.freshClimbsOnly && signedIn}
+                  disabled={!signedIn}
                   onValueChange={(freshClimbsOnly) => change({ freshClimbsOnly })}
                 />
               ) : null}
             </Section>
 
-            {isFree ? (
-              <Text variant="small" tone="tertiary" style={styles.note}>
-                A clock runs while you pick climbs yourself from the Session tab.
-              </Text>
-            ) : (
+            {isFree ? null : (
               <View style={styles.previewBlock}>
                 <View style={styles.previewHeader}>
-                  <View style={styles.flex}>
-                    <Text variant="label">Your climbs</Text>
-                    {summary ? (
-                      <Text variant="mono" tone="secondary" style={styles.summary}>
-                        {summary}
-                      </Text>
-                    ) : null}
-                  </View>
+                  <Text variant="mono" tone="secondary" style={styles.flex}>
+                    {summary}
+                  </Text>
                   <Button
                     title="Shuffle"
                     variant="ghost"
                     size="sm"
                     icon={Shuffle}
-                    disabled={building}
+                    disabled={loading || !preview}
                     onPress={() => setShuffleCount(shuffleCount + 1)}
                   />
                 </View>
-                {preview && preview.missing > 0 ? (
+                {noClimbs ? <Text tone="tertiary">No climbs fit these settings.</Text> : null}
+                {preview && preview.missing > 0 && !noClimbs ? (
                   <Text variant="small" tone="tertiary">
-                    {preview.missing} left out: not enough climbs at that grade on your board.
+                    Found {planned.length} of {planned.length + preview.missing} climbs.
                   </Text>
                 ) : null}
-                {buildError ? (
+                {error ? (
                   <Section>
-                    <Text tone="danger">{buildError}</Text>
-                    <Button title="Try again" variant="secondary" onPress={() => setShuffleCount(shuffleCount + 1)} />
+                    <Text tone="danger">{error}</Text>
+                    <Button title="Try again" variant="secondary" onPress={retry} />
                   </Section>
                 ) : null}
-                {preview ? (
-                  <Card flush style={building ? styles.stale : undefined}>
+                {preview && !noClimbs ? (
+                  <Card flush style={loading ? styles.stale : undefined}>
                     {planned.map((entry, index) => {
                       const quality = climbQuality(entry.climb);
                       return (
@@ -418,7 +481,7 @@ export default function WorkoutSetupScreen() {
                       );
                     })}
                   </Card>
-                ) : building ? (
+                ) : loading ? (
                   <ActivityIndicator style={styles.loading} />
                 ) : null}
               </View>
@@ -433,7 +496,7 @@ export default function WorkoutSetupScreen() {
             { borderTopColor: theme.border2, backgroundColor: theme.bgApp, paddingBottom: spacing.md + insets.bottom },
           ]}
         >
-          <Button title="Start workout" size="lg" icon={Play} fullWidth disabled={!canStart} onPress={start} />
+          <Button title={startLabel} size="lg" icon={Play} fullWidth disabled={!canStart} onPress={start} />
         </View>
       ) : null}
     </View>
@@ -444,12 +507,10 @@ const styles = StyleSheet.create({
   flex: { flex: 1 },
   center: { flex: 1, alignItems: 'center', justifyContent: 'center' },
   content: { paddingHorizontal: GUTTER, paddingBottom: spacing.xxl, gap: spacing.md },
-  titleBlock: { gap: spacing.sm, paddingBottom: spacing.xs },
+  title: { paddingBottom: spacing.xs },
   field: { gap: spacing.sm },
-  note: { paddingHorizontal: spacing.xxs },
   previewBlock: { gap: spacing.sm, marginTop: spacing.xs },
   previewHeader: { flexDirection: 'row', alignItems: 'center', gap: spacing.sm, paddingLeft: spacing.xxs },
-  summary: { marginTop: spacing.xs },
   stale: { opacity: 0.5 },
   previewRow: { flexDirection: 'row', alignItems: 'center', gap: spacing.xs, paddingRight: spacing.sm },
   previewMain: {

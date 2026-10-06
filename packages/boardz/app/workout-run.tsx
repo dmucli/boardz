@@ -221,11 +221,9 @@ export default function WorkoutRunScreen() {
               { label: 'Time', value: formatElapsed((runner.finishedAt ?? now.getTime()) - runner.startedAt) },
             ]}
           />
-          <Text tone="tertiary">
-            {logger.canLog
-              ? 'Every climb you logged is in your Boardsesh logbook. Your session keeps running until you end it on Home.'
-              : 'Sign in next time to save workout climbs to your logbook.'}
-          </Text>
+          {logger.canLog ? null : (
+            <Text tone="tertiary">Sign in next time to save workout climbs to your logbook.</Text>
+          )}
         </ScrollView>
         <View style={actionBarStyle}>
           <Button title="Finish" size="lg" fullWidth onPress={finish} />

@@ -6,12 +6,16 @@ import {
   estimateMinutes,
   plannedGrades,
   usesField,
+  warmUpGrades,
   workoutTiming,
   workoutTitle,
 } from './workout-config';
 
 const moonboardGrades = getGradesForBoard('moonboard');
+// What a MoonBoard at 40° has workout climbs at: 6A+ (17) and up.
+const moonboardAt40 = moonboardGrades.filter((grade) => grade.difficulty_id >= 17);
 const SIX_B = 18;
+const SEVEN_A = 22;
 
 describe('plannedGrades', () => {
   it('builds a pyramid up to the peak and back down', () => {
@@ -38,8 +42,35 @@ describe('plannedGrades', () => {
     expect(grades).toEqual([14, 15, 16, 17, 18, 18]);
   });
 
+  it('keeps a pyramid on grades the board has climbs at', () => {
+    const config = { ...defaultConfig('pyramid', SIX_B), warmUp: false };
+    expect(plannedGrades(config, moonboardAt40)).toEqual([17, 17, 18, 17, 17]);
+  });
+
   it('plans nothing for free climbing', () => {
     expect(plannedGrades(defaultConfig('freeClimbing', SIX_B), moonboardGrades)).toEqual([]);
+  });
+});
+
+describe('warmUpGrades', () => {
+  it('always gives a short warm-up 4 climbs and a long one 12', () => {
+    for (const target of [17, SIX_B, SEVEN_A, 30]) {
+      expect(warmUpGrades(target, moonboardAt40, 'standard')).toHaveLength(4);
+      expect(warmUpGrades(target, moonboardAt40, 'extended')).toHaveLength(12);
+    }
+  });
+
+  it('steps up one grade per climb when the board has the grades', () => {
+    expect(warmUpGrades(SEVEN_A, moonboardAt40, 'standard')).toEqual([18, 19, 20, 21]);
+  });
+
+  it('gives the easier grades the extra climbs when there are fewer grades than climbs', () => {
+    expect(warmUpGrades(SEVEN_A, moonboardAt40, 'extended')).toEqual([17, 17, 17, 18, 18, 18, 19, 19, 20, 20, 21, 21]);
+    expect(warmUpGrades(SIX_B, moonboardAt40, 'standard')).toEqual([17, 17, 17, 17]);
+  });
+
+  it('warms up at the target when nothing on the board is easier', () => {
+    expect(warmUpGrades(17, moonboardAt40, 'standard')).toEqual([17, 17, 17, 17]);
   });
 });
 
@@ -67,6 +98,14 @@ describe('workout setup', () => {
           usesField(workout.kind, field as Parameters<typeof usesField>[1]),
         ),
       ).toBe(true);
+    }
+  });
+
+  it('lets every workout that picks climbs limit them to benchmarks and unsent climbs', () => {
+    for (const workout of WORKOUTS) {
+      const picksClimbs = workout.kind !== 'freeClimbing';
+      expect(usesField(workout.kind, 'benchmarksOnly')).toBe(picksClimbs);
+      expect(usesField(workout.kind, 'freshClimbsOnly')).toBe(picksClimbs);
     }
   });
 

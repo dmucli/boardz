@@ -35,19 +35,24 @@ export type WorkoutConfig = {
   goalMinutes: number | null;
   /** Prefer climbs the climber hasn't sent yet. Needs sign-in. */
   freshClimbsOnly: boolean;
+  /** Only the board's benchmark problems. */
+  benchmarksOnly: boolean;
 };
 
 export type ConfigField = Exclude<keyof WorkoutConfig, 'kind' | 'targetGrade'>;
 
+// Every workout that picks climbs can limit them to benchmarks and to climbs not yet sent.
+const CLIMB_FILTERS: ConfigField[] = ['benchmarksOnly', 'freshClimbsOnly'];
+
 const FIELDS: Record<WorkoutKind, ConfigField[]> = {
-  warmUp: ['warmUpLength', 'restSeconds'],
-  pyramid: ['steps', 'climbsPerStep', 'restSeconds', 'warmUp', 'freshClimbsOnly'],
-  ladder: ['steps', 'climbsPerStep', 'restSeconds', 'warmUp', 'freshClimbsOnly'],
-  volume: ['climbs', 'spread', 'restSeconds', 'warmUp', 'freshClimbsOnly'],
-  gradeFocus: ['climbs', 'restSeconds', 'warmUp', 'freshClimbsOnly'],
-  onTheMinute: ['climbs', 'intervalSeconds', 'freshClimbsOnly'],
-  fourByFour: ['rounds', 'restBetweenClimbsSeconds', 'restBetweenRoundsSeconds', 'freshClimbsOnly'],
-  limitBouldering: ['climbs', 'restSeconds', 'freshClimbsOnly'],
+  warmUp: ['warmUpLength', 'restSeconds', ...CLIMB_FILTERS],
+  pyramid: ['steps', 'climbsPerStep', 'restSeconds', 'warmUp', ...CLIMB_FILTERS],
+  ladder: ['steps', 'climbsPerStep', 'restSeconds', 'warmUp', ...CLIMB_FILTERS],
+  volume: ['climbs', 'spread', 'restSeconds', 'warmUp', ...CLIMB_FILTERS],
+  gradeFocus: ['climbs', 'restSeconds', 'warmUp', ...CLIMB_FILTERS],
+  onTheMinute: ['climbs', 'intervalSeconds', ...CLIMB_FILTERS],
+  fourByFour: ['rounds', 'restBetweenClimbsSeconds', 'restBetweenRoundsSeconds', ...CLIMB_FILTERS],
+  limitBouldering: ['climbs', 'restSeconds', ...CLIMB_FILTERS],
   freeClimbing: ['goalMinutes'],
 };
 
@@ -69,6 +74,7 @@ const BASE: Omit<WorkoutConfig, 'kind' | 'targetGrade'> = {
   restBetweenRoundsSeconds: 240,
   goalMinutes: 60,
   freshClimbsOnly: false,
+  benchmarksOnly: false,
 };
 
 const KIND_DEFAULTS: Record<WorkoutKind, Partial<WorkoutConfig>> = {
@@ -97,43 +103,83 @@ const GENERATOR_FILTERS: Omit<BaseGeneratorOptions, 'warmUp' | 'targetGrade'> = 
   onlyWideClimbs: false,
 };
 
-/** The grade of every climb in the workout, in order. 4x4 lists its four climbs once. */
+const WARM_UP_SHAPE: Record<WorkoutConfig['warmUpLength'], { climbs: number; grades: number }> = {
+  standard: { climbs: 4, grades: 4 },
+  extended: { climbs: 12, grades: 6 },
+};
+
+/**
+ * Warm-up climbs, easiest first, spread over the grades just below the target:
+ * 4 climbs over up to 4 grades, or 12 over up to 6. When the board has fewer
+ * grades below the target, the easier ones take the extra climbs; with none
+ * below it, every warm-up climb is at the target.
+ *
+ * The generator's own warm-up drops climbs instead, so a 6B warm-up on a
+ * MoonBoard, which has nothing under 6A+, came out with one climb.
+ */
+export function warmUpGrades(
+  targetGrade: number,
+  grades: GeneratorGradeScale,
+  length: WorkoutConfig['warmUpLength'],
+): number[] {
+  const shape = WARM_UP_SHAPE[length];
+  const below = grades
+    .map((grade) => grade.difficulty_id)
+    .filter((grade) => grade < targetGrade)
+    .sort((first, second) => first - second)
+    .slice(-shape.grades);
+  if (below.length === 0) return Array.from({ length: shape.climbs }, () => targetGrade);
+  const perGrade = Math.floor(shape.climbs / below.length);
+  const extra = shape.climbs % below.length;
+  return below.flatMap((grade, index) => Array.from({ length: perGrade + (index < extra ? 1 : 0) }, () => grade));
+}
+
+/**
+ * The grade of every climb in the workout, in order. 4x4 lists its four climbs
+ * once. `grades` should only hold grades the board has climbs at.
+ */
 export function plannedGrades(config: WorkoutConfig, grades: GeneratorGradeScale): number[] {
-  const base = {
-    ...GENERATOR_FILTERS,
-    targetGrade: config.targetGrade,
-    warmUp: config.warmUp ? 'standard' : 'none',
-  } as const;
+  const base = { ...GENERATOR_FILTERS, targetGrade: config.targetGrade, warmUp: 'none' } as const;
+  const warmUp = config.warmUp ? warmUpGrades(config.targetGrade, grades, 'standard') : [];
   const toGrades = (slots: { grade: number }[]) => slots.map((slot) => slot.grade);
   switch (config.kind) {
     case 'warmUp':
-      // A warm-up is the generator's warm-up section with no main set after it.
-      return toGrades(
-        generateWorkoutPlan({ ...base, type: 'gradeFocus', warmUp: config.warmUpLength, numberOfClimbs: 0 }, grades),
-      );
+      return warmUpGrades(config.targetGrade, grades, config.warmUpLength);
     case 'pyramid':
-      return toGrades(
-        generateWorkoutPlan(
-          { ...base, type: 'pyramid', numberOfSteps: config.steps, climbsPerStep: config.climbsPerStep },
-          grades,
+      return [
+        ...warmUp,
+        ...toGrades(
+          generateWorkoutPlan(
+            { ...base, type: 'pyramid', numberOfSteps: config.steps, climbsPerStep: config.climbsPerStep },
+            grades,
+          ),
         ),
-      );
+      ];
     case 'ladder':
-      return toGrades(
-        generateWorkoutPlan(
-          { ...base, type: 'ladder', numberOfSteps: config.steps, climbsPerStep: config.climbsPerStep },
-          grades,
+      return [
+        ...warmUp,
+        ...toGrades(
+          generateWorkoutPlan(
+            { ...base, type: 'ladder', numberOfSteps: config.steps, climbsPerStep: config.climbsPerStep },
+            grades,
+          ),
         ),
-      );
+      ];
     case 'volume':
-      return toGrades(
-        generateWorkoutPlan(
-          { ...base, type: 'volume', mainSetClimbs: config.climbs, mainSetVariability: config.spread },
-          grades,
+      return [
+        ...warmUp,
+        ...toGrades(
+          generateWorkoutPlan(
+            { ...base, type: 'volume', mainSetClimbs: config.climbs, mainSetVariability: config.spread },
+            grades,
+          ),
         ),
-      );
+      ];
     case 'gradeFocus':
-      return toGrades(generateWorkoutPlan({ ...base, type: 'gradeFocus', numberOfClimbs: config.climbs }, grades));
+      return [
+        ...warmUp,
+        ...toGrades(generateWorkoutPlan({ ...base, type: 'gradeFocus', numberOfClimbs: config.climbs }, grades)),
+      ];
     case 'onTheMinute':
     case 'limitBouldering':
       return Array.from({ length: config.climbs }, () => config.targetGrade);

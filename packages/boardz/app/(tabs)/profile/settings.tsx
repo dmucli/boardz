@@ -1,7 +1,7 @@
 import { Alert, Linking, ScrollView, StyleSheet, View } from 'react-native';
 import { router } from 'expo-router';
 import Constants from 'expo-constants';
-import { WEB_BASE_URL } from '../../../src/api/env';
+import { ACCOUNT_SETTINGS_URL, WEB_BASE_URL } from '../../../src/api/env';
 import { useAuth } from '../../../src/auth/auth-provider';
 import { describeBoard } from '../../../src/board/active-board';
 import { useBoard } from '../../../src/board/board-provider';
@@ -120,6 +120,14 @@ export default function SettingsScreen() {
                 />
               </View>
               <Button title="Sign out" variant="danger" icon={LogOut} onPress={confirmSignOut} />
+              <Button
+                title="Delete account"
+                variant="ghost"
+                size="sm"
+                icon={ExternalLink}
+                accessibilityHint="Opens your Boardsesh account settings, where you can delete your account"
+                onPress={() => void Linking.openURL(ACCOUNT_SETTINGS_URL)}
+              />
             </>
           ) : (
             <Button title="Sign in" fullWidth onPress={() => router.push('/login')} />

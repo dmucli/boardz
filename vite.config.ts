@@ -1024,6 +1024,9 @@ export default defineConfig({
       'typecheck:boardz': {
         command: 'pnpm --filter boardz run typecheck',
         dependsOn: ['build:shared', 'build:constants'],
+        // The cache didn't see edits to Boardz's own files and replayed a stale
+        // pass; a full check takes a few seconds anyway.
+        cache: false,
       },
       'dev:boardz': {
         command: 'pnpm --filter boardz run start',
@@ -1037,6 +1040,12 @@ export default defineConfig({
       // Release: "Boardz", with its code built in, so it works away from your Mac.
       'ios:boardz:release': {
         command: 'pnpm --filter boardz run ios:release',
+        cache: false,
+      },
+      // Builds Boardz for the App Store and uploads it to TestFlight
+      // (packages/boardz/scripts/testflight.sh).
+      'ios:boardz:testflight': {
+        command: 'pnpm --filter boardz run testflight',
         cache: false,
       },
       // Both backend projects: `backend-serial` holds the files that share
